@@ -8,9 +8,10 @@
   var TTS_URL = /\/backend-api\/(?:synthesize|speech\/generation)(?:[/?#]|$)/i;
   var READ_ALOUD = /(read.?aloud|озвучить|прочитать\s+вслух|читать\s+вслух)/i;
   var MAX_BYTES = 80 * 1024 * 1024;
-  var FETCH_FINAL_DELAY = 5000;
+  // ChatGPT may request the next TTS piece only when playback nears the end
+  // of the current piece. Keep the same capture session alive across those gaps.
+  var FETCH_FINAL_DELAY = 75000;
   var MSE_FINAL_DELAY = 10000;
-  var FETCH_PRIORITY = 15000;
   var nativeFetch = window.fetch && window.fetch.bind(window);
   var nativeCreateObjectURL = URL.createObjectURL.bind(URL);
   var nativeRevokeObjectURL = URL.revokeObjectURL.bind(URL);
@@ -21,6 +22,7 @@
   var fetchPublishTimer = 0;
   var fetchFinalTimer = 0;
   var lastFetchActivity = 0;
+  var fetchCapturedForPlayback = false;
   var mseSeq = 0;
   var mseSession = null;
   var msePublishTimer = 0;
@@ -129,11 +131,17 @@
 
   function beginFetch(meta) {
     var now = Date.now();
-    var mustStart = !fetchSession || forceNew ||
-      (fetchSession.messageId && meta.messageId && fetchSession.messageId !== meta.messageId) ||
-      (fetchSession.final && now - fetchSession.lastAt > 1500) ||
-      now - fetchSession.lastAt > 90000;
+    var sameMessage = !!(fetchSession && fetchSession.messageId && meta.messageId && fetchSession.messageId === meta.messageId);
+    var differentMessage = !!(fetchSession && fetchSession.messageId && meta.messageId && fetchSession.messageId !== meta.messageId);
+    var anonymousExpired = !!(fetchSession && !fetchSession.messageId && !meta.messageId && now - fetchSession.lastAt > 120000);
+
+    // Important: one Read Aloud run can consist of several HTTP TTS responses
+    // spaced tens of seconds apart. If message_id is the same, keep appending
+    // even if the previous response had already been marked final.
+    var mustStart = !fetchSession || forceNew || differentMessage || (!sameMessage && anonymousExpired);
     if (mustStart) newFetchSession(meta);
+
+    fetchCapturedForPlayback = true;
     clearTimeout(fetchFinalTimer);
     fetchSession.final = false;
     fetchSession.partCount += 1;
@@ -237,7 +245,10 @@
   }
 
   function publishMse(isFinal) {
-    if (!mseSession || Date.now() - lastFetchActivity < FETCH_PRIORITY) return;
+    // MSE sees the same bytes that the fetch hook already captured. Once the
+    // fetch path works for this playback, never let the fallback overwrite the
+    // accumulated TTS session with a shorter duplicate.
+    if (!mseSession || fetchCapturedForPlayback) return;
     send(mseSession, 'mse-stream', isFinal);
   }
 
@@ -298,9 +309,14 @@
       });
       if (!button) return;
       var label = [button.getAttribute('aria-label'), button.getAttribute('title'), button.getAttribute('data-testid'), button.textContent].filter(Boolean).join(' ');
-      if (READ_ALOUD.test(label)) forceNew = true;
+      if (READ_ALOUD.test(label)) {
+        forceNew = true;
+        fetchCapturedForPlayback = false;
+        mseSession = null;
+        clearTimeout(mseFinalTimer);
+      }
     } catch (_) {}
   }, true);
 
-  debug('v0.4.0 installed');
+  debug('v0.4.1 installed');
 })();
